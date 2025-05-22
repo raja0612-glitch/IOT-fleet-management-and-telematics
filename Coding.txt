@@ -1,0 +1,195 @@
+#include <SPI.h>
+#include <TinyGPSPlus.h>
+#include <SD.h>
+#include <SoftwareSerial.h>
+#include <TimeLib.h>
+#include <TM1637Display.h>
+
+// GPS & Display Setup
+TinyGPSPlus gps;
+SoftwareSerial gpsInput(9, 8); // RX, TX
+TM1637Display display(A0, A1);
+
+// SD & Time
+File trkFile;
+const byte SD_CS = 10, SD_LED = 7;
+const int TIME_OFFSET = -10800;
+bool sdReady = false, createFile = true, sdActive = false;
+uint32_t logCounter = 0, lastLogTime = 0, changeCount = 0, interval = 1;
+
+// Data Memory
+struct {
+  float lat, lng, alt, spd, crs;
+} memory;
+
+// Local time struct
+struct {
+  int sec, min, hour, day, mon, year;
+} localTime;
+
+void setup() {
+  pinMode(SD_LED, OUTPUT);
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, HIGH);
+  delay(500);
+  digitalWrite(LED_BUILTIN, LOW);
+
+  Serial.begin(9600);             // Debug serial output
+  gpsInput.begin(9600);           // GPS serial
+  display.setBrightness(5);       // Bright display
+  display.showNumberDecEx(8888, 0x40); // Startup pattern
+  delay(500);
+  display.clear();
+
+  sdReady = SD.begin(SD_CS);
+  if (sdReady) digitalWrite(SD_LED, HIGH);
+
+  actualizar_hora_local();
+}
+
+void loop() {
+  leer_datos_gps();
+
+  // Print debug info
+  if (gps.location.isValid()) {
+    Serial.print("Lat: "); Serial.print(gps.location.lat(), 6);
+    Serial.print("  Lng: "); Serial.print(gps.location.lng(), 6);
+    Serial.print("  Alt: "); Serial.print(gps.altitude.meters(), 2);
+    Serial.print("  Spd: "); Serial.print(gps.speed.kmph(), 2);
+    Serial.print("  Course: "); Serial.println(gps.course.deg(), 2);
+  } else {
+    Serial.println("Waiting for GPS signal...");
+  }
+
+  // Show dummy speed on display for demo if no movement
+  float speed = gps.speed.kmph();
+  if (!gps.speed.isValid() || speed < 1.0) {
+    speed = 25.0; // Dummy speed for testing
+  }
+
+  display.showNumberDec((int)speed, false);
+  delay(1000);
+  display.clear();
+  delay(500);
+
+  if (!gps.location.isValid() || !gps.time.isValid() || !gps.date.isValid())
+    return;
+
+  if (sdReady && createFile) {
+    actualizar_hora_local();
+    char filename[13];
+    snprintf(filename, sizeof(filename), "%04d%02d%02d.csv",
+             localTime.year, localTime.mon, localTime.day);
+    SdFile::dateTimeCallback(fechaHoraSD);
+    trkFile = SD.open(filename, FILE_WRITE);
+    if (trkFile) {
+      trkFile.println(F("trackpoint,date,time,latitude,longitude,alt,speed,course"));
+      trkFile.close();
+      createFile = false;
+    }
+  }
+
+  bool newData =
+    gps.location.lat() != memory.lat ||
+    gps.location.lng() != memory.lng ||
+    gps.altitude.meters() != memory.alt ||
+    gps.speed.kmph() != memory.spd ||
+    gps.course.deg() != memory.crs;
+
+  changeCount++;
+  interval = (changeCount > 340) ? 45 : (changeCount > 160) ? 30 :
+             (changeCount > 70) ? 15 : (changeCount > 10) ? 10 : 1;
+
+  if (newData || logCounter >= interval) {
+    logCounter = 0;
+    if (newData) changeCount = 0;
+    actualizar_memoria();
+    guardar_datos();
+  }
+
+  if (sdActive && millis() - lastLogTime > 150) {
+    sdActive = false;
+    digitalWrite(SD_LED, HIGH);
+  }
+}
+
+// GPS Reading
+void leer_datos_gps() {
+  while (gpsInput.available()) {
+    gps.encode(gpsInput.read());
+  }
+}
+
+void actualizar_memoria() {
+  memory.lat = gps.location.lat();
+  memory.lng = gps.location.lng();
+  memory.alt = gps.altitude.meters();
+  memory.spd = gps.speed.kmph();
+  memory.crs = gps.course.deg();
+}
+
+void actualizar_hora_local() {
+  
+  if (!gps.time.isValid() || !gps.date.isValid()) return;tmElements_t tm;
+  tm.Year = gps.date.year() - 1970;
+  tm.Month = gps.date.month();
+  tm.Day = gps.date.day();
+  tm.Hour = gps.time.hour();
+  tm.Minute = gps.time.minute();
+  tm.Second = gps.time.second();
+  time_t epoch = makeTime(tm) + TIME_OFFSET;
+  localTime = { second(epoch), minute(epoch), hour(epoch), day(epoch), month(epoch), year(epoch) };
+}
+
+void fechaHoraSD(uint16_t* date, uint16_t* time) {
+  *date = FAT_DATE(localTime.year, localTime.mon, localTime.day);
+  *time = FAT_TIME(localTime.hour, localTime.min, localTime.sec);
+}
+
+void guardar_datos() {
+  char filename[13];
+  snprintf(filename, sizeof(filename), "%04d%02d%02d.csv",
+           localTime.year, localTime.mon, localTime.day);
+  trkFile = SD.open(filename, FILE_WRITE);
+  if (!trkFile) {
+  Serial.println("Error opening file for writing.");
+  return;
+}
+
+  digitalWrite(SD_LED, LOW);
+  lastLogTime = millis();
+  sdActive = true;
+
+  trkFile.print(++logCounter);
+  trkFile.print(',');
+  trkFile.print(formatear_fecha());
+  trkFile.print(',');
+  trkFile.print(formatear_hora());
+  trkFile.print(',');
+  trkFile.print(gps.location.lat(), 6);
+  trkFile.print(',');
+  trkFile.print(gps.location.lng(), 6);
+  trkFile.print(',');
+  trkFile.print(gps.altitude.meters(), 2);
+  trkFile.print(',');
+  trkFile.print(gps.speed.kmph(), 2);
+  trkFile.print(',');
+  trkFile.println(gps.course.deg(), 2);
+
+  trkFile.flush();
+  trkFile.close();
+}
+
+String formatear_fecha() {
+  char buffer[11];
+  snprintf(buffer, sizeof(buffer), "%04d/%02d/%02d",
+           localTime.year, localTime.mon, localTime.day);
+  return String(buffer);
+}
+
+String formatear_hora() {
+  char buffer[9];
+  snprintf(buffer, sizeof(buffer), "%02d:%02d:%02d",
+           localTime.hour, localTime.min, localTime.sec);
+  return String(buffer);
+}
